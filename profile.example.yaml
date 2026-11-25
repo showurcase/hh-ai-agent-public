@@ -1,0 +1,63 @@
+candidate:
+  name: ""
+  location: ""
+  desired_positions: []
+  experience_summary: ""
+  education: ""
+  technologies: []
+  projects: []
+  github_url: ""
+  salary_expectation: ""
+  work_format: []
+  excluded_positions:
+    - "Стажер"
+    - "Junior"
+    - "1C"
+    - "1С"
+    - "HR"
+    - "SMM"
+    - "Маркетолог"
+    - "Ассистент"
+    - "Секретарь"
+    - "Менеджер по продажам"
+    - "Product Manager"
+    - "Product Builder"
+    - "Product Engineer"
+    - "Менеджер по продукту"
+    - "Менеджер продукта"
+    - "Продакт"
+    - "Project Manager"
+    - "Менеджер проектов"
+    - "Менеджер интеграционных проектов"
+    - "Руководитель проектов"
+    - "Process manager"
+    - "Data Engineer"
+    - "Data Analyst"
+    - "Аналитик данных"
+    - "Продуктовый аналитик"
+    - "Программист"
+    - "Разработчик"
+    - "Product Owner"
+    - "Владелец продукта"
+    - "Владелец ИТ-Продукта"
+  # Case-insensitive fragments checked against the employer name.
+  excluded_companies: []
+  # Case-insensitive fragments checked against the vacancy description.
+  excluded_keywords: []
+  additional_information: ""
+
+hh:
+  resume_name: ""
+  search_queries: []
+  areas: []
+  experience_filters: []
+  # Restrict HH search to vacancies marked as remote work.
+  remote_only: false
+
+cover_letter:
+  language: "ru"
+  max_length: 1800
+  style: "professional"
+  # When configured, the exact portfolio URL is required before every application.
+  required_portfolio_url: ""
+  closing: ""

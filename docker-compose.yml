@@ -1,0 +1,37 @@
+services:
+  hh-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: local/hh-ai-agent:latest
+    container_name: hh-ai-agent
+    restart: unless-stopped
+    network_mode: host
+    shm_size: "1gb"
+    env_file:
+      - .env
+    volumes:
+      - ./agent.db:/app/agent.db
+      - ./agent.log:/app/agent.log
+      - ./profile.yaml:/app/profile.yaml:ro
+      - ./tg_bot.py:/app/tg_bot.py:ro
+      - ./ai_analyzer.py:/app/ai_analyzer.py:ro
+      - ./cover_letter.py:/app/cover_letter.py:ro
+      - ./config.py:/app/config.py:ro
+      - ./approval.py:/app/approval.py:ro
+      - ./database.py:/app/database.py:ro
+      - ./fit_summary.py:/app/fit_summary.py:ro
+      - ./hh_client.py:/app/hh_client.py:ro
+      - ./main.py:/app/main.py:ro
+      - ./legend.py:/app/legend.py:ro
+      - ./questionnaire.py:/app/questionnaire.py:ro
+      - ./queue_page.py:/app/queue_page.py:ro
+      - ./ai_priority.py:/app/ai_priority.py:ro
+      - ./logging_setup.py:/app/logging_setup.py:ro
+      - ./llm:/app/llm:ro
+      - ./legend:/app/legend:ro
+      - ./.env:/app/.env
+      - ./.browser-profile:/app/.browser-profile
+      - ./.cloakbrowser:/root/.cloakbrowser
+      - ./mascots/assets:/app/mascots/assets:ro
+    command: ["--pesec"]

@@ -1,0 +1,587 @@
+from __future__ import annotations
+
+import base64
+import binascii
+import ipaddress
+import math
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import yaml
+from dotenv import dotenv_values
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+class ConfigError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class CandidateProfile:
+    name: str
+    location: str
+    desired_positions: tuple[str, ...]
+    experience_summary: str
+    education: str
+    technologies: tuple[str, ...]
+    projects: tuple[str, ...]
+    github_url: str
+    salary_expectation: str
+    work_format: tuple[str, ...]
+    excluded_positions: tuple[str, ...]
+    additional_information: str
+    excluded_companies: tuple[str, ...] = ()
+    excluded_keywords: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class HHProfile:
+    resume_name: str
+    search_queries: tuple[str, ...]
+    areas: tuple[str, ...]
+    experience_filters: tuple[str, ...]
+    remote_only: bool = False
+
+
+@dataclass(frozen=True)
+class CoverLetterProfile:
+    language: str
+    max_length: int
+    style: str
+    required_portfolio_url: str = ""
+    closing: str = ""
+
+
+@dataclass(frozen=True)
+class Profile:
+    candidate: CandidateProfile
+    hh: HHProfile
+    cover_letter: CoverLetterProfile
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    provider: str
+    model: str
+    timeout_seconds: int
+    max_retries: int
+    temperature: float
+    max_output_tokens: int
+    max_requests_per_day: int
+    ollama_url: str
+    mistral_api_key: str
+    mistral_keys_master_key: str
+    mistral_base_url: str
+    openai_compatible_base_url: str
+    openai_compatible_api_key: str
+    openai_compatible_json_mode: bool
+    openai_compatible_reasoning_enabled: bool | None = None
+    openai_compatible_reasoning_effort: str | None = None
+    captcha_model: str | None = None
+    questionnaire_timeout_seconds: int = 240
+
+
+@dataclass(frozen=True)
+class AutoApplySettings:
+    enabled: bool
+    min_confidence: float
+    min_batch_size: int
+    max_batch_size: int
+    min_interval_hours: int
+    max_interval_hours: int
+    start_hour: int
+    end_hour: int
+    timezone: str
+
+
+@dataclass(frozen=True)
+class Settings:
+    tg_bot_token: str
+    tg_user_id: int
+    llm: LLMSettings
+    app_mode: str
+    enable_real_apply: bool
+    browser_backend: str
+    browser_headless: bool
+    browser_profile_dir: Path
+    database_path: Path
+    log_path: Path
+    legend_path: Path
+    check_interval_minutes: int
+    max_applications_per_day: int
+    max_vacancies_per_query: int
+    max_pages_per_query: int
+    min_seconds_between_actions: int
+    approval_ttl_minutes: int
+    auto_apply: AutoApplySettings
+    captcha_timeout_seconds: int
+    captcha_max_attempts: int
+    captcha_switch_to_english: bool
+    circuit_breaker_min_sample: int
+    circuit_breaker_unknown_ratio: float
+    circuit_breaker_page_errors: int
+    queue_page_enabled: bool
+    queue_page_host: str
+    queue_page_port: int
+    queue_page_public_url: str
+    queue_page_secret: str
+    profile: Profile
+    hh_order_by: str = "publication_time"
+    hh_search_period: int = 1
+
+    @property
+    def ollama_url(self) -> str:
+        return self.llm.ollama_url
+
+    @property
+    def ollama_model(self) -> str:
+        return self.llm.model
+
+
+def _path(value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+def _strings(section: Mapping[str, object], key: str) -> tuple[str, ...]:
+    value = section.get(key, [])
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise TypeError(f"{key} must be a list of strings")
+    return tuple(item.strip() for item in value if item.strip())
+
+
+def _text(section: Mapping[str, object], key: str, default: str = "") -> str:
+    value = section.get(key, default)
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be a string")
+    return value.strip()
+
+
+def load_settings(
+    env_path: Path | str = BASE_DIR / ".env",
+    profile_path: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Settings:
+    values: dict[str, str] = {}
+    resolved_env_path = Path(env_path)
+    if environ is None:
+        if resolved_env_path.exists():
+            values = {
+                key: value
+                for key, value in dotenv_values(resolved_env_path, encoding="utf-8").items()
+                if value is not None
+            }
+        values.update(os.environ)
+    else:
+        if resolved_env_path != BASE_DIR / ".env" and resolved_env_path.exists():
+            values = {
+                key: value
+                for key, value in dotenv_values(resolved_env_path, encoding="utf-8").items()
+                if value is not None
+            }
+        values.update(environ)
+    errors: list[str] = []
+
+    def required(key: str) -> str:
+        value = values.get(key, "").strip()
+        if not value:
+            errors.append(f"{key} is required")
+        return value
+
+    def boolean(key: str, default: str) -> bool:
+        value = values.get(key, default).strip().lower()
+        if value not in {"true", "false"}:
+            errors.append(f"{key} must be true or false")
+            return False
+        return value == "true"
+
+    def positive_integer(key: str, default: str) -> int:
+        value = values.get(key, default).strip()
+        try:
+            parsed = int(value)
+        except ValueError:
+            errors.append(f"{key} must be an integer")
+            return 1
+        if parsed <= 0:
+            errors.append(f"{key} must be a positive integer")
+            return 1
+        return parsed
+
+    def non_negative_integer(key: str, default: str) -> int:
+        value = values.get(key, default).strip()
+        try:
+            parsed = int(value)
+        except ValueError:
+            errors.append(f"{key} must be an integer")
+            return 0
+        if parsed < 0:
+            errors.append(f"{key} must be zero or greater")
+            return 0
+        return parsed
+
+    def hour(key: str, default: str) -> int:
+        value = values.get(key, default).strip()
+        try:
+            parsed = int(value)
+        except ValueError:
+            errors.append(f"{key} must be an integer hour between 0 and 23")
+            return 0
+        if not 0 <= parsed <= 23:
+            errors.append(f"{key} must be an integer hour between 0 and 23")
+            return 0
+        return parsed
+
+    def number(key: str, default: str) -> float:
+        value = values.get(key, default).strip()
+        try:
+            parsed = float(value)
+        except ValueError:
+            errors.append(f"{key} must be a number")
+            return 0.0
+        if not math.isfinite(parsed) or not 0 <= parsed <= 2:
+            errors.append(f"{key} must be between 0 and 2")
+            return 0.0
+        return parsed
+
+    def ratio(key: str, default: str) -> float:
+        value = values.get(key, default).strip()
+        try:
+            parsed = float(value)
+        except ValueError:
+            errors.append(f"{key} must be a number")
+            return 1.0
+        if not math.isfinite(parsed) or not 0 < parsed <= 1:
+            errors.append(f"{key} must be greater than 0 and at most 1")
+            return 1.0
+        return parsed
+
+    def is_loopback(hostname: str | None) -> bool:
+        if not hostname:
+            return False
+        if hostname.lower() == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            return False
+
+    def validate_endpoint(key: str, value: str, *, https_only: bool = False) -> None:
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            errors.append(f"{key} must be a valid HTTP(S) URL")
+            return
+        if https_only and parsed.scheme != "https":
+            errors.append(f"{key} must use HTTPS")
+        elif parsed.scheme == "http" and not is_loopback(parsed.hostname):
+            errors.append(f"{key} must use HTTPS for non-loopback hosts")
+
+    def valid_fernet_key(value: str) -> bool:
+        try:
+            return len(base64.urlsafe_b64decode(value.encode())) == 32
+        except (ValueError, binascii.Error):
+            return False
+
+    app_mode = values.get("APP_MODE", "dry_run").strip().lower()
+    if app_mode not in {"dry_run", "approval", "auto"}:
+        errors.append("APP_MODE must be dry_run, approval or auto")
+    enable_real_apply = boolean("ENABLE_REAL_APPLY", "false")
+
+    # APP_MODE=auto is the hybrid mode: non-AI vacancies are applied to
+    # automatically, AI/LLM vacancies still go to Telegram for a manual reply.
+    auto_apply_enabled = boolean("AUTO_APPLY_ENABLED", "false") or app_mode == "auto"
+    auto_apply_min_confidence = ratio("AUTO_APPLY_MIN_CONFIDENCE", "0.85")
+    auto_apply_min_batch_size = positive_integer("AUTO_APPLY_MIN_BATCH_SIZE", "5")
+    auto_apply_max_batch_size = positive_integer("AUTO_APPLY_MAX_BATCH_SIZE", "6")
+    def interval_hours(key: str, default: str) -> int:
+        """Zero means "start the next batch as soon as the previous one ends"."""
+        raw = values.get(key, default).strip()
+        try:
+            parsed = int(raw)
+        except ValueError:
+            errors.append(f"{key} must be an integer")
+            return 0
+        if parsed < 0:
+            errors.append(f"{key} must be zero or positive")
+            return 0
+        return parsed
+
+    auto_apply_min_interval_hours = interval_hours(
+        "AUTO_APPLY_MIN_INTERVAL_HOURS", "3"
+    )
+    auto_apply_max_interval_hours = interval_hours(
+        "AUTO_APPLY_MAX_INTERVAL_HOURS", "5"
+    )
+    auto_apply_start_hour = hour("AUTO_APPLY_START_HOUR", "10")
+    auto_apply_end_hour = hour("AUTO_APPLY_END_HOUR", "22")
+    auto_apply_timezone = values.get("AUTO_APPLY_TIMEZONE", "UTC").strip()
+    try:
+        ZoneInfo(auto_apply_timezone)
+    except (ValueError, ZoneInfoNotFoundError):
+        errors.append("AUTO_APPLY_TIMEZONE must be an IANA timezone")
+    if auto_apply_min_batch_size > auto_apply_max_batch_size:
+        errors.append("AUTO_APPLY_MIN_BATCH_SIZE must be at most AUTO_APPLY_MAX_BATCH_SIZE")
+    if auto_apply_enabled and auto_apply_max_batch_size > positive_integer(
+        "MAX_APPLICATIONS_PER_DAY", "5"
+    ):
+        errors.append("AUTO_APPLY_MAX_BATCH_SIZE must not exceed MAX_APPLICATIONS_PER_DAY")
+    if auto_apply_min_interval_hours > auto_apply_max_interval_hours:
+        errors.append(
+            "AUTO_APPLY_MIN_INTERVAL_HOURS must be at most AUTO_APPLY_MAX_INTERVAL_HOURS"
+        )
+    if auto_apply_start_hour >= auto_apply_end_hour:
+        errors.append("AUTO_APPLY_START_HOUR must be before AUTO_APPLY_END_HOUR")
+    if auto_apply_enabled and app_mode not in {"approval", "auto"}:
+        errors.append("AUTO_APPLY_ENABLED requires APP_MODE=approval or auto")
+    if auto_apply_enabled and not enable_real_apply:
+        errors.append("AUTO_APPLY_ENABLED requires ENABLE_REAL_APPLY=true")
+    if app_mode == "auto" and not enable_real_apply:
+        errors.append("APP_MODE=auto requires ENABLE_REAL_APPLY=true")
+
+    queue_page_enabled = boolean("QUEUE_PAGE_ENABLED", "false")
+    queue_page_public_url = values.get("QUEUE_PAGE_PUBLIC_URL", "").strip()
+    queue_page_secret = values.get("QUEUE_PAGE_SECRET", "").strip()
+    if queue_page_enabled:
+        if not queue_page_public_url:
+            errors.append("QUEUE_PAGE_PUBLIC_URL is required when QUEUE_PAGE_ENABLED=true")
+        elif not queue_page_public_url.startswith(("http://", "https://")):
+            errors.append("QUEUE_PAGE_PUBLIC_URL must be an HTTP(S) URL")
+        if not queue_page_secret:
+            errors.append("QUEUE_PAGE_SECRET is required when QUEUE_PAGE_ENABLED=true")
+
+    browser_backend = values.get("BROWSER_BACKEND", "cloakbrowser").strip().lower()
+    if browser_backend not in {"cloakbrowser", "playwright"}:
+        errors.append("BROWSER_BACKEND must be cloakbrowser or playwright")
+
+    llm_provider = values.get("LLM_PROVIDER", "ollama").strip().lower()
+    if llm_provider not in {"ollama", "mistral", "openai_compatible"}:
+        errors.append("LLM_PROVIDER must be ollama, mistral or openai_compatible")
+    llm_model = values.get("LLM_MODEL", "").strip()
+    if not llm_model and llm_provider == "ollama":
+        llm_model = values.get("OLLAMA_MODEL", "llama3").strip()
+    if not llm_model:
+        errors.append("LLM_MODEL is required")
+    ollama_url = values.get(
+        "OLLAMA_URL", "http://localhost:11434/api/generate"
+    ).strip()
+    mistral_api_key = values.get("MISTRAL_API_KEY", "").strip()
+    mistral_keys_master_key = values.get("MISTRAL_KEYS_MASTER_KEY", "").strip()
+    mistral_base_url = values.get("MISTRAL_BASE_URL", "").strip()
+    compatible_base_url = values.get("OPENAI_COMPATIBLE_BASE_URL", "").strip()
+    compatible_api_key = values.get("OPENAI_COMPATIBLE_API_KEY", "").strip()
+    if llm_provider == "ollama":
+        validate_endpoint("OLLAMA_URL", ollama_url)
+    elif llm_provider == "mistral":
+        if not mistral_keys_master_key:
+            errors.append("MISTRAL_KEYS_MASTER_KEY is required")
+        elif not valid_fernet_key(mistral_keys_master_key):
+            errors.append("MISTRAL_KEYS_MASTER_KEY must be a valid Fernet key")
+        if mistral_base_url:
+            validate_endpoint("MISTRAL_BASE_URL", mistral_base_url, https_only=True)
+    elif llm_provider == "openai_compatible":
+        if not compatible_base_url:
+            errors.append("OPENAI_COMPATIBLE_BASE_URL is required")
+        else:
+            validate_endpoint("OPENAI_COMPATIBLE_BASE_URL", compatible_base_url)
+        if not compatible_api_key:
+            errors.append("OPENAI_COMPATIBLE_API_KEY is required")
+
+    tg_user_id_text = required("TG_USER_ID")
+    try:
+        tg_user_id = int(tg_user_id_text)
+    except ValueError:
+        errors.append("TG_USER_ID must be an integer")
+        tg_user_id = 0
+
+    selected_profile = Path(profile_path) if profile_path else _path(values.get("PROFILE_PATH", "profile.yaml"))
+    if not selected_profile.exists():
+        errors.append(f"profile file not found: {selected_profile}")
+        raw_profile: object = {}
+    else:
+        try:
+            raw_profile = yaml.safe_load(selected_profile.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            errors.append(f"cannot read profile: {exc}")
+            raw_profile = {}
+
+    if not isinstance(raw_profile, dict):
+        errors.append("profile root must be a mapping")
+        raw_profile = {}
+
+    def section(name: str) -> Mapping[str, object]:
+        value = raw_profile.get(name, {})
+        if not isinstance(value, dict):
+            errors.append(f"{name} must be a mapping")
+            return {}
+        return value
+
+    candidate_data = section("candidate")
+    hh_data = section("hh")
+    cover_data = section("cover_letter")
+    remote_only_value = hh_data.get("remote_only", False)
+    if not isinstance(remote_only_value, bool):
+        errors.append("hh.remote_only must be true or false")
+        remote_only_value = False
+
+    try:
+        candidate = CandidateProfile(
+            name=_text(candidate_data, "name"),
+            location=_text(candidate_data, "location"),
+            desired_positions=_strings(candidate_data, "desired_positions"),
+            experience_summary=_text(candidate_data, "experience_summary"),
+            education=_text(candidate_data, "education"),
+            technologies=_strings(candidate_data, "technologies"),
+            projects=_strings(candidate_data, "projects"),
+            github_url=_text(candidate_data, "github_url"),
+            salary_expectation=_text(candidate_data, "salary_expectation"),
+            work_format=_strings(candidate_data, "work_format"),
+            excluded_positions=_strings(candidate_data, "excluded_positions"),
+            additional_information=_text(candidate_data, "additional_information"),
+            excluded_companies=_strings(candidate_data, "excluded_companies"),
+            excluded_keywords=_strings(candidate_data, "excluded_keywords"),
+        )
+        hh = HHProfile(
+            resume_name=_text(hh_data, "resume_name"),
+            search_queries=_strings(hh_data, "search_queries"),
+            areas=_strings(hh_data, "areas"),
+            experience_filters=_strings(hh_data, "experience_filters"),
+            remote_only=remote_only_value,
+        )
+        max_length_value = cover_data.get("max_length", 1800)
+        if isinstance(max_length_value, bool) or not isinstance(max_length_value, int) or max_length_value <= 0:
+            errors.append("cover_letter.max_length must be a positive integer")
+            max_length_value = 1800
+        cover_letter = CoverLetterProfile(
+            language=_text(cover_data, "language", "ru"),
+            max_length=max_length_value,
+            style=_text(cover_data, "style", "professional"),
+            required_portfolio_url=_text(cover_data, "required_portfolio_url"),
+            closing=_text(cover_data, "closing"),
+        )
+        if cover_letter.required_portfolio_url:
+            validate_endpoint(
+                "cover_letter.required_portfolio_url",
+                cover_letter.required_portfolio_url,
+                https_only=True,
+            )
+        if cover_letter.required_portfolio_url or cover_letter.closing:
+            footer_parts = []
+            if cover_letter.required_portfolio_url:
+                footer_parts.append(
+                    f"Портфолио: {cover_letter.required_portfolio_url}"
+                )
+            if cover_letter.closing:
+                footer_parts.append(cover_letter.closing)
+            footer = "\n\n" + "\n\n".join(footer_parts)
+            if len(footer) >= cover_letter.max_length:
+                errors.append("cover_letter.max_length must leave room for the required portfolio and letter")
+    except TypeError as exc:
+        errors.append(str(exc))
+        candidate = CandidateProfile("", "", (), "", "", (), (), "", "", (), (), "")
+        hh = HHProfile("", (), (), ())
+        cover_letter = CoverLetterProfile("ru", 1800, "professional")
+
+    if not candidate.name:
+        errors.append("candidate.name is required")
+    if not candidate.desired_positions:
+        errors.append("candidate.desired_positions must not be empty")
+    if not candidate.experience_summary:
+        errors.append("candidate.experience_summary is required")
+    if not hh.resume_name:
+        errors.append("hh.resume_name is required")
+    if not hh.search_queries:
+        errors.append("hh.search_queries must not be empty")
+
+    llm_timeout_seconds = positive_integer("LLM_TIMEOUT_SECONDS", "30")
+    questionnaire_timeout_seconds = positive_integer(
+        "LLM_QUESTIONNAIRE_TIMEOUT_SECONDS",
+        str(max(llm_timeout_seconds, 240)),
+    )
+
+    settings = Settings(
+        tg_bot_token=required("TG_BOT_TOKEN"),
+        tg_user_id=tg_user_id,
+        llm=LLMSettings(
+            provider=llm_provider,
+            model=llm_model,
+            timeout_seconds=llm_timeout_seconds,
+            questionnaire_timeout_seconds=questionnaire_timeout_seconds,
+            max_retries=non_negative_integer("LLM_MAX_RETRIES", "1"),
+            temperature=number("LLM_TEMPERATURE", "0"),
+            max_output_tokens=positive_integer("LLM_MAX_OUTPUT_TOKENS", "1200"),
+            max_requests_per_day=positive_integer("LLM_MAX_REQUESTS_PER_DAY", "100"),
+            ollama_url=ollama_url,
+            mistral_api_key=mistral_api_key,
+            mistral_keys_master_key=mistral_keys_master_key,
+            mistral_base_url=mistral_base_url,
+            openai_compatible_base_url=compatible_base_url,
+            openai_compatible_api_key=compatible_api_key,
+            openai_compatible_json_mode=boolean(
+                "OPENAI_COMPATIBLE_JSON_MODE", "true"
+            ),
+            openai_compatible_reasoning_enabled=(
+                boolean("OPENAI_COMPATIBLE_REASONING_ENABLED", "false")
+                if values.get("OPENAI_COMPATIBLE_REASONING_ENABLED", "").strip()
+                else None
+            ),
+            openai_compatible_reasoning_effort=(
+                values.get("OPENAI_COMPATIBLE_REASONING_EFFORT", "").strip() or None
+            ),
+            captcha_model=values.get("CAPTCHA_MODEL", "").strip() or None,
+        ),
+        app_mode=app_mode,
+        enable_real_apply=enable_real_apply,
+        browser_backend=browser_backend,
+        browser_headless=boolean("BROWSER_HEADLESS", "false"),
+        browser_profile_dir=_path(values.get("BROWSER_PROFILE_DIR", ".browser-profile")),
+        database_path=_path(values.get("DATABASE_PATH", "agent.db")),
+        log_path=_path(values.get("LOG_PATH", "agent.log")),
+        legend_path=_path(
+            values.get("LEGEND_PATH", "legend/legend_full.json")
+        ),
+        check_interval_minutes=positive_integer("CHECK_INTERVAL_MINUTES", "30"),
+        max_applications_per_day=positive_integer("MAX_APPLICATIONS_PER_DAY", "5"),
+        max_vacancies_per_query=positive_integer("MAX_VACANCIES_PER_QUERY", "20"),
+        max_pages_per_query=positive_integer("MAX_PAGES_PER_QUERY", "2"),
+        hh_order_by=values.get("HH_ORDER_BY", "publication_time").strip() or "publication_time",
+        hh_search_period=non_negative_integer("HH_SEARCH_PERIOD", "1"),
+        min_seconds_between_actions=positive_integer("MIN_SECONDS_BETWEEN_ACTIONS", "5"),
+        approval_ttl_minutes=positive_integer("APPROVAL_TTL_MINUTES", "30"),
+        auto_apply=AutoApplySettings(
+            enabled=auto_apply_enabled,
+            min_confidence=auto_apply_min_confidence,
+            min_batch_size=auto_apply_min_batch_size,
+            max_batch_size=auto_apply_max_batch_size,
+            min_interval_hours=auto_apply_min_interval_hours,
+            max_interval_hours=auto_apply_max_interval_hours,
+            start_hour=auto_apply_start_hour,
+            end_hour=auto_apply_end_hour,
+            timezone=auto_apply_timezone,
+        ),
+        captcha_timeout_seconds=positive_integer("CAPTCHA_TIMEOUT_SECONDS", "120"),
+        captcha_switch_to_english=boolean("CAPTCHA_SWITCH_TO_ENGLISH", "false"),
+        captcha_max_attempts=positive_integer("CAPTCHA_MAX_ATTEMPTS", "2"),
+        circuit_breaker_min_sample=positive_integer(
+            "CIRCUIT_BREAKER_MIN_SAMPLE", "5"
+        ),
+        circuit_breaker_unknown_ratio=ratio(
+            "CIRCUIT_BREAKER_UNKNOWN_RATIO", "0.8"
+        ),
+        circuit_breaker_page_errors=positive_integer(
+            "CIRCUIT_BREAKER_PAGE_ERRORS", "3"
+        ),
+        queue_page_enabled=queue_page_enabled,
+        queue_page_host=values.get("QUEUE_PAGE_HOST", "0.0.0.0").strip() or "0.0.0.0",
+        queue_page_port=positive_integer("QUEUE_PAGE_PORT", "8787"),
+        queue_page_public_url=queue_page_public_url,
+        queue_page_secret=queue_page_secret,
+        profile=Profile(candidate, hh, cover_letter),
+    )
+    if errors:
+        raise ConfigError("Configuration error:\n- " + "\n- ".join(dict.fromkeys(errors)))
+    return settings

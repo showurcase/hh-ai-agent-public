@@ -1,0 +1,19 @@
+# Образ для тестов: полный python:3.12 уже содержит git, плюс браузер
+# Playwright, без которого падают два анкетных теста.
+#
+#   docker build -f Dockerfile.test -t hh-ai-agent-tests .
+#   docker run --rm -v "$PWD":/app -w /app hh-ai-agent-tests python -m pytest tests -q
+FROM python:3.12
+
+RUN pip install --retries 10 --timeout 60 --no-cache-dir \
+        pytest pytest-asyncio \
+        pydantic pydantic-settings aiohttp aiogram PyYAML pillow \
+        mistralai httpx python-dotenv cryptography playwright
+
+RUN python -m playwright install --with-deps chromium
+
+WORKDIR /app
+
+# Каталог монтируется с хоста, у него другой владелец: без этого git
+# отказывается работать и тест про .gitignore падает.
+RUN git config --system --add safe.directory /app
